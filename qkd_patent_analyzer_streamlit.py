@@ -6,6 +6,7 @@ from typing import Dict, List
 import json
 import io
 import re
+import os
 
 # Page configuration
 st.set_page_config(
@@ -186,15 +187,16 @@ def process_patents(df: pd.DataFrame, client, model: str, prompt_template: str,
         # Classify the patent
         classification = classify_patent(row, client, model, prompt_template, column_mapping)
 
-        # Add classification results to the row
+        # Add classification results to the row - dynamically extract all fields
         result_row = row.to_dict()
-        result_row['relevance'] = classification['relevance']
-        result_row['relevance_percentage'] = classification.get('relevance_percentage', 0)
-        result_row['confidence'] = classification['confidence']
-        result_row['reasoning'] = classification['reasoning']
-        result_row['key_features_found'] = ', '.join(classification['key_features_found'])
-        result_row['protocols_mentioned'] = ', '.join(classification['protocols_mentioned'])
-        result_row['relevance_source'] = classification.get('relevance_source', 'N/A')
+
+        # Iterate through all classification fields and add them to result
+        for key, value in classification.items():
+            # Convert lists to comma-separated strings for better Excel compatibility
+            if isinstance(value, list):
+                result_row[key] = ', '.join(str(item) for item in value)
+            else:
+                result_row[key] = value
 
         results.append(result_row)
 
@@ -368,6 +370,10 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
+    # Store input filename for output naming
+    input_filename = uploaded_file.name
+    input_basename = os.path.splitext(input_filename)[0]
+
     # Read the file based on its type
     try:
         file_extension = uploaded_file.name.split('.')[-1].lower()
@@ -410,7 +416,7 @@ if uploaded_file is not None:
                 st.download_button(
                     label="Download Consolidated TSV",
                     data=tsv_data,
-                    file_name="consolidated_patents.tsv",
+                    file_name=f"{input_basename}_consolidated.tsv",
                     mime="text/tab-separated-values",
                     help="Download the consolidated patent data as TSV"
                 )
@@ -421,7 +427,7 @@ if uploaded_file is not None:
                 st.download_button(
                     label="Download Consolidated CSV",
                     data=csv_data,
-                    file_name="consolidated_patents.csv",
+                    file_name=f"{input_basename}_consolidated.csv",
                     mime="text/csv",
                     help="Download the consolidated patent data as CSV"
                 )
@@ -562,33 +568,57 @@ if uploaded_file is not None:
                 st.metric("Total Patents", total_patents)
 
             with col2:
-                relevant_count = len(results_df[results_df['relevance'] == 'RELEVANT'])
-                st.metric("Relevant Patents", relevant_count, f"{(relevant_count/total_patents*100):.1f}%")
+                if 'relevance' in results_df.columns:
+                    relevant_count = len(results_df[results_df['relevance'] == 'RELEVANT'])
+                    st.metric("Relevant Patents", relevant_count, f"{(relevant_count/total_patents*100):.1f}%")
+                else:
+                    st.metric("Relevant Patents", "N/A")
 
             with col3:
-                avg_relevance = results_df['relevance_percentage'].mean()
-                st.metric("Avg Relevance Score", f"{avg_relevance:.1f}%")
+                if 'relevance_percentage' in results_df.columns:
+                    avg_relevance = results_df['relevance_percentage'].mean()
+                    st.metric("Avg Relevance Score", f"{avg_relevance:.1f}%")
+                else:
+                    st.metric("Avg Relevance Score", "N/A")
 
             with col4:
-                high_confidence = len(results_df[results_df['confidence'] == 'HIGH'])
-                st.metric("High Confidence", high_confidence)
+                if 'confidence' in results_df.columns:
+                    high_confidence = len(results_df[results_df['confidence'] == 'HIGH'])
+                    st.metric("High Confidence", high_confidence)
+                else:
+                    st.metric("High Confidence", "N/A")
 
             # Charts
             col1, col2 = st.columns(2)
 
             with col1:
                 st.subheader("Relevance Distribution")
-                relevance_counts = results_df['relevance'].value_counts()
-                st.bar_chart(relevance_counts)
+                if 'relevance' in results_df.columns:
+                    relevance_counts = results_df['relevance'].value_counts()
+                    st.bar_chart(relevance_counts)
+                else:
+                    st.info("No 'relevance' column found in results")
 
             with col2:
                 st.subheader("Confidence Distribution")
-                confidence_counts = results_df['confidence'].value_counts()
-                st.bar_chart(confidence_counts)
+                if 'confidence' in results_df.columns:
+                    confidence_counts = results_df['confidence'].value_counts()
+                    st.bar_chart(confidence_counts)
+                else:
+                    st.info("No 'confidence' column found in results")
 
             # Relevant patents details
             st.subheader("Relevant Patents")
-            relevant_patents = results_df[results_df['relevance'] == 'RELEVANT'].sort_values('relevance_percentage', ascending=False)
+
+            # Check if required columns exist
+            if 'relevance' in results_df.columns:
+                # Sort by relevance_percentage if it exists, otherwise don't sort
+                if 'relevance_percentage' in results_df.columns:
+                    relevant_patents = results_df[results_df['relevance'] == 'RELEVANT'].sort_values('relevance_percentage', ascending=False)
+                else:
+                    relevant_patents = results_df[results_df['relevance'] == 'RELEVANT']
+            else:
+                relevant_patents = pd.DataFrame()  # Empty dataframe if no relevance column
 
             if len(relevant_patents) > 0:
                 for idx, patent in relevant_patents.iterrows():
@@ -629,7 +659,7 @@ if uploaded_file is not None:
                 st.download_button(
                     label="Download as Excel",
                     data=output,
-                    file_name="qkd_patent_analysis_results.xlsx",
+                    file_name=f"{input_basename}_output.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
@@ -639,7 +669,7 @@ if uploaded_file is not None:
                 st.download_button(
                     label="Download as CSV",
                     data=csv,
-                    file_name="qkd_patent_analysis_results.csv",
+                    file_name=f"{input_basename}_output.csv",
                     mime="text/csv"
                 )
 
@@ -690,4 +720,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown("Made with Streamlit | QKD Patent Analyzer v1.0")
+# st.markdown("Made with Streamlit | QKD Patent Analyzer v1.0")

@@ -155,13 +155,17 @@ def main():
     """Main function to process the Excel file"""
 
     # File path
-    excel_file = "output.tsv"
+    excel_file = "SET - 3 - 1 - CHECK 300 2.CSV"
+
+    # Generate output filename based on input filename
+    input_basename = os.path.splitext(os.path.basename(excel_file))[0]
+    output_file = f"{input_basename}_output.xlsx"
 
     print(f"Reading CSV file: {excel_file}")
 
     # Read the TSV file
     try:
-        df = pd.read_csv(excel_file, sep='\t')
+        df = pd.read_csv(excel_file)
         print(f"Successfully loaded {len(df)} rows")
         print(f"Columns found: {df.columns.tolist()}")
     except FileNotFoundError:
@@ -198,21 +202,29 @@ def main():
         # Classify the patent
         classification = classify_patent(row)
 
-        # Add classification results to the row
+        # Add classification results to the row - dynamically extract all fields
         result_row = row.to_dict()
-        result_row['relevance'] = classification['relevance']
-        result_row['relevance_percentage'] = classification.get('relevance_percentage', 0)
-        result_row['confidence'] = classification['confidence']
-        result_row['reasoning'] = classification['reasoning']
-        result_row['key_features_found'] = ', '.join(classification['key_features_found'])
-        result_row['protocols_mentioned'] = ', '.join(classification['protocols_mentioned'])
-        result_row['relevance_source'] = classification.get('relevance_source', 'N/A')
+
+        # Iterate through all classification fields and add them to result
+        for key, value in classification.items():
+            # Convert lists to comma-separated strings for better Excel compatibility
+            if isinstance(value, list):
+                result_row[key] = ', '.join(str(item) for item in value)
+            else:
+                result_row[key] = value
 
         results.append(result_row)
 
-        print(f"Result: {classification['relevance']} - {classification.get('relevance_percentage', 0)}% (Confidence: {classification['confidence']})")
-        print(f"Source: {classification.get('relevance_source', 'N/A')}")
-        print(f"Reasoning: {classification['reasoning'][:100]}...")
+        # Print results with safe key access
+        relevance = classification.get('relevance', 'N/A')
+        relevance_pct = classification.get('relevance_percentage', 0)
+        confidence = classification.get('confidence', 'N/A')
+        reasoning = classification.get('reasoning', 'N/A')
+        relevance_source = classification.get('relevance_source', 'N/A')
+
+        print(f"Result: {relevance} - {relevance_pct}% (Confidence: {confidence})")
+        print(f"Source: {relevance_source}")
+        print(f"Reasoning: {str(reasoning)[:100]}...")
 
         # Add a small delay to avoid rate limiting
         time.sleep(0.5)
@@ -258,8 +270,7 @@ def main():
                 if continuation_num > 2:
                     results_df.loc[idx, f'description_continued_{continuation_num-1}'] = remaining
 
-    # Save results to Excel
-    output_file = "test_output_csv.xlsx"
+    # Save results to Excel (output_file already defined at the beginning of main())
     results_df.to_excel(output_file, index=False)
 
     print("\n" + "=" * 80)
