@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application files
 COPY qkd_patent_analyzer_streamlit.py .
 COPY qkd_patent_analyzer.py .
+COPY logo.png .
 
 # Expose Streamlit port
 EXPOSE 8501
