@@ -11,7 +11,7 @@ import os
 # Page configuration
 st.set_page_config(
     page_title="IeB Classifier",
-    page_icon="🔬",
+    page_icon="logo.png",
     layout="wide"
 )
 
@@ -274,7 +274,11 @@ Respond ONLY with the JSON object, no additional text.
 """
 
 # Main UI
-st.title("🔬 IeB Classifier")
+col1, col2 = st.columns([1, 10])
+with col1:
+    st.image("logo.png", width=60)
+with col2:
+    st.title("IeB Classifier")
 st.markdown("Analyze patents for your task and check the relevancy through AI")
 
 # Sidebar for configuration
