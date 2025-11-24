@@ -5,6 +5,7 @@ import time
 from typing import Dict, List
 import json
 from dotenv import load_dotenv
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,6 +22,70 @@ client = AzureOpenAI(
     api_version=AZURE_API_VERSION,
     azure_endpoint=AZURE_ENDPOINT
 )
+
+def consolidate_patent_records(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Consolidate multi-row patent records into single rows.
+    Handles cases where descriptions are split across multiple rows.
+    """
+    # Pattern to detect a new publication number (US, CN, KR, EP, WO, JP etc.)
+    pub_pattern = re.compile(r'^[A-Z]{2}\d+')
+
+    final_rows = []
+    current_record = None
+
+    # Find the publication number and description columns
+    pub_col = None
+    desc_col = None
+
+    for col in df.columns:
+        col_lower = col.strip().lower()
+        if 'publication' in col_lower and 'number' in col_lower:
+            pub_col = col
+        elif 'description' in col_lower:
+            desc_col = col
+
+    # If we can't find a publication number column, return as-is
+    if not pub_col:
+        return df
+
+    for _, row in df.iterrows():
+        pub_no = str(row[pub_col]).strip() if pub_col else ""
+
+        # If row begins with a valid publication number – start a new block
+        if pub_pattern.match(pub_no):
+            # Save previous record
+            if current_record:
+                final_rows.append(current_record)
+
+            # Start new record - preserve original column names
+            current_record = {}
+            for col in df.columns:
+                if col == pub_col:
+                    current_record[col] = pub_no
+                elif col == desc_col:
+                    current_record[col] = str(row.get(col, ""))
+                else:
+                    current_record[col] = row.get(col, "")
+
+        else:
+            # This is continuation text – append to description field
+            if current_record and desc_col:
+                extra = str(row.get(desc_col, "")).strip()
+                if extra and extra != 'nan':
+                    # Check if the previous description already ends with """ (indicating end of description)
+                    if not current_record[desc_col].rstrip().endswith('"""'):
+                        current_record[desc_col] += "\n" + extra
+
+    # Save last record
+    if current_record:
+        final_rows.append(current_record)
+
+    # Convert to DataFrame
+    if final_rows:
+        return pd.DataFrame(final_rows)
+    else:
+        return df
 
 def create_classification_prompt(publication_number, title, abstract, claims, independent_claims) -> str:
     """Create the prompt for QKD relevance classification"""
@@ -89,6 +154,116 @@ Respond ONLY with the JSON object, no additional text.
  
 
 """
+def classify_patent_chunked(row: pd.Series, chunk_size: int = 15000) -> Dict:
+    """Classify patent using chunking when content is too large"""
+
+    publication_number = row.get('publication number', 'N/A')
+    title = row.get('title', 'N/A')
+    abstract = row.get('abstract', 'N/A')
+    claims = row.get('claims', 'N/A')
+    description = str(row.get('description', 'N/A'))
+
+    print(f"  Content too large - using chunked analysis")
+
+    # Strategy: Analyze in parts
+    # 1. First chunk: Title + Abstract + Claims (most important)
+    # 2. If description is large, split it into chunks
+
+    chunks = []
+
+    # Always include title, abstract, and claims in first chunk
+    first_chunk_desc = description[:chunk_size] if len(description) > chunk_size else description
+    chunks.append({
+        'title': title,
+        'abstract': abstract,
+        'claims': claims,
+        'description': first_chunk_desc,
+        'part': 1
+    })
+
+    # If description is longer, create additional chunks
+    if len(description) > chunk_size:
+        remaining_desc = description[chunk_size:]
+        part_num = 2
+        while remaining_desc:
+            chunk_desc = remaining_desc[:chunk_size]
+            chunks.append({
+                'title': '',
+                'abstract': '',
+                'claims': '',
+                'description': chunk_desc,
+                'part': part_num
+            })
+            remaining_desc = remaining_desc[chunk_size:]
+            part_num += 1
+
+    print(f"  Split into {len(chunks)} chunks")
+
+    # Analyze each chunk
+    results = []
+    for i, chunk in enumerate(chunks):
+        try:
+            prompt = create_classification_prompt(
+                publication_number,
+                chunk['title'],
+                chunk['abstract'],
+                chunk['claims'],
+                chunk['description']
+            )
+
+            response = client.chat.completions.create(
+                model=AZURE_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a quantum technology expert specializing in patent analysis."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
+            )
+
+            response_text = response.choices[0].message.content.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+
+            result = json.loads(response_text)
+            results.append(result)
+            print(f"  Chunk {i+1}/{len(chunks)} analyzed: {result.get('relevance_percentage', 0)}%")
+
+        except Exception as e:
+            print(f"  Error in chunk {i+1}: {e}")
+            continue
+
+    # Combine results - take the highest relevance found
+    if not results:
+        return {
+            "relevance": "ERROR",
+            "relevance_percentage": 0,
+            "confidence": "LOW",
+            "reasoning": "Failed to analyze any chunks",
+            "key_features_found": [],
+            "protocols_mentioned": [],
+            "relevance_source": "N/A"
+        }
+
+    # Find the result with highest relevance
+    best_result = max(results, key=lambda x: x.get('relevance_percentage', 0))
+
+    # Combine key features from all chunks
+    all_features = []
+    all_protocols = []
+    for r in results:
+        all_features.extend(r.get('key_features_found', []))
+        all_protocols.extend(r.get('protocols_mentioned', []))
+
+    best_result['key_features_found'] = list(set(all_features))
+    best_result['protocols_mentioned'] = list(set(all_protocols))
+    best_result['reasoning'] = f"[Chunked analysis] {best_result.get('reasoning', '')}"
+
+    return best_result
+
+
 def classify_patent(row: pd.Series) -> Dict:
     """Send patent data to Azure OpenAI for classification"""
 
@@ -139,6 +314,12 @@ def classify_patent(row: pd.Series) -> Dict:
             "relevance_source": "N/A"
         }
     except Exception as e:
+        error_msg = str(e).lower()
+        # Check if it's a context length error
+        if 'context' in error_msg or 'token' in error_msg or 'length' in error_msg or 'too large' in error_msg or 'maximum' in error_msg:
+            print(f"  Context length exceeded - switching to chunked analysis")
+            return classify_patent_chunked(row)
+
         print(f"Error calling Azure OpenAI: {e}")
         return {
             "relevance": "ERROR",
@@ -160,10 +341,11 @@ def main():
     # Generate output filename based on input filename
     input_basename = os.path.splitext(os.path.basename(excel_file))[0]
     output_file = f"{input_basename}_output.xlsx"
+    consolidated_tsv_file = f"{input_basename}_consolidated.tsv"
 
     print(f"Reading CSV file: {excel_file}")
 
-    # Read the TSV file
+    # Read the CSV file
     try:
         df = pd.read_csv(excel_file)
         print(f"Successfully loaded {len(df)} rows")
@@ -178,6 +360,17 @@ def main():
 
     # Normalize column names (lowercase and strip spaces)
     df.columns = df.columns.str.strip().str.lower()
+
+    original_row_count = len(df)
+
+    # Consolidate multi-row patent records
+    print(f"\nConsolidating multi-row patent records...")
+    df = consolidate_patent_records(df)
+    print(f"Consolidated {original_row_count} rows into {len(df)} patent records")
+
+    # Save consolidated data as TSV
+    df.to_csv(consolidated_tsv_file, sep='\t', index=False)
+    print(f"Consolidated data saved to: {consolidated_tsv_file}")
 
     # Check if required columns exist
     required_columns = ['publication number', 'title', 'abstract', 'claims']
@@ -232,43 +425,57 @@ def main():
     # Create results DataFrame
     results_df = pd.DataFrame(results)
 
+    # Remove unnamed columns (columns that start with 'Unnamed:')
+    unnamed_cols = [col for col in results_df.columns if str(col).startswith('Unnamed:')]
+    if unnamed_cols:
+        print(f"\nRemoving {len(unnamed_cols)} unnamed columns: {unnamed_cols}")
+        results_df = results_df.drop(columns=unnamed_cols)
+
     # Split long descriptions into multiple columns
     # Excel cell limit is ~32,767 characters
     MAX_CELL_LENGTH = 32000
 
-    if 'description' in results_df.columns:
+    # Find description column dynamically
+    desc_col = None
+    for col in results_df.columns:
+        if 'description' in str(col).lower():
+            desc_col = col
+            break
+
+    if desc_col:
         # Check if any descriptions need to be split
-        descriptions_to_split = results_df['description'].fillna('').astype(str)
+        descriptions_to_split = results_df[desc_col].fillna('').astype(str)
         needs_continuation = descriptions_to_split.str.len() > MAX_CELL_LENGTH
 
         if needs_continuation.any():
             print(f"\nSplitting {needs_continuation.sum()} long descriptions into continuation columns...")
 
             # Create description_continued column
-            results_df['description_continued'] = ''
+            desc_continued_col = f'{desc_col}_continued'
+            results_df[desc_continued_col] = ''
 
             for idx in results_df[needs_continuation].index:
-                full_desc = str(results_df.loc[idx, 'description'])
+                full_desc = str(results_df.loc[idx, desc_col])
 
                 # Split the description
-                results_df.loc[idx, 'description'] = full_desc[:MAX_CELL_LENGTH]
-                results_df.loc[idx, 'description_continued'] = full_desc[MAX_CELL_LENGTH:]
+                results_df.loc[idx, desc_col] = full_desc[:MAX_CELL_LENGTH]
+                results_df.loc[idx, desc_continued_col] = full_desc[MAX_CELL_LENGTH:]
 
                 # If still too long, handle additional splits
                 remaining = full_desc[MAX_CELL_LENGTH:]
                 continuation_num = 2
                 while len(remaining) > MAX_CELL_LENGTH:
-                    col_name = f'description_continued_{continuation_num}'
+                    col_name = f'{desc_col}_continued_{continuation_num}'
                     if col_name not in results_df.columns:
                         results_df[col_name] = ''
 
-                    results_df.loc[idx, f'description_continued_{continuation_num-1}'] = remaining[:MAX_CELL_LENGTH]
+                    results_df.loc[idx, f'{desc_col}_continued_{continuation_num-1}'] = remaining[:MAX_CELL_LENGTH]
                     remaining = remaining[MAX_CELL_LENGTH:]
                     continuation_num += 1
 
                 # Add the final remaining part
                 if continuation_num > 2:
-                    results_df.loc[idx, f'description_continued_{continuation_num-1}'] = remaining
+                    results_df.loc[idx, f'{desc_col}_continued_{continuation_num-1}'] = remaining
 
     # Save results to Excel (output_file already defined at the beginning of main())
     results_df.to_excel(output_file, index=False)

@@ -41,23 +41,14 @@ def consolidate_patent_records(df: pd.DataFrame) -> pd.DataFrame:
     final_rows = []
     current_record = None
 
-    # Find the actual column names in the dataframe
+    # Find the publication number and description columns
     pub_col = None
-    title_col = None
-    abstract_col = None
-    claims_col = None
     desc_col = None
 
     for col in df.columns:
         col_lower = col.strip().lower()
         if 'publication' in col_lower and 'number' in col_lower:
             pub_col = col
-        elif col_lower == 'title':
-            title_col = col
-        elif 'abstract' in col_lower:
-            abstract_col = col
-        elif 'claim' in col_lower:
-            claims_col = col
         elif 'description' in col_lower:
             desc_col = col
 
@@ -74,21 +65,24 @@ def consolidate_patent_records(df: pd.DataFrame) -> pd.DataFrame:
             if current_record:
                 final_rows.append(current_record)
 
-            # Start new record
-            current_record = {
-                "publication number": pub_no,
-                "title": row.get(title_col, "") if title_col else "",
-                "abstract": row.get(abstract_col, "") if abstract_col else "",
-                "claims": row.get(claims_col, "") if claims_col else "",
-                "description": str(row.get(desc_col, "")) if desc_col else ""
-            }
+            # Start new record - preserve original column names
+            current_record = {}
+            for col in df.columns:
+                if col == pub_col:
+                    current_record[col] = pub_no
+                elif col == desc_col:
+                    current_record[col] = str(row.get(col, ""))
+                else:
+                    current_record[col] = row.get(col, "")
 
         else:
             # This is continuation text – append to description field
             if current_record and desc_col:
                 extra = str(row.get(desc_col, "")).strip()
                 if extra and extra != 'nan':
-                    current_record["description"] += "\n" + extra
+                    # Check if the previous description already ends with """ (indicating end of description)
+                    if not current_record[desc_col].rstrip().endswith('"""'):
+                        current_record[desc_col] += "\n" + extra
 
     # Save last record
     if current_record:
@@ -120,6 +114,94 @@ def create_classification_prompt(prompt_template: str, row_data: Dict) -> str:
         placeholder = f"{{{key}}}"
         prompt = prompt.replace(placeholder, str(value) if pd.notna(value) else 'N/A')
     return prompt
+
+def classify_patent_chunked(row: pd.Series, client, model: str, prompt_template: str, column_mapping: Dict, chunk_size: int = 15000) -> Dict:
+    """Classify patent using chunking when content is too large"""
+
+    # Get the description column value
+    desc_col = column_mapping.get('description', '')
+    description = str(row.get(desc_col, 'N/A'))
+
+    # Strategy: Split description into chunks while keeping other fields intact
+    chunks = []
+
+    # First chunk includes all fields with partial description
+    first_chunk_desc = description[:chunk_size] if len(description) > chunk_size else description
+    first_chunk_data = {}
+    for standard_name, actual_column in column_mapping.items():
+        if standard_name == 'description':
+            first_chunk_data[standard_name] = first_chunk_desc
+        else:
+            first_chunk_data[standard_name] = row.get(actual_column, 'N/A')
+    chunks.append(first_chunk_data)
+
+    # Additional chunks with remaining description
+    if len(description) > chunk_size:
+        remaining_desc = description[chunk_size:]
+        while remaining_desc:
+            chunk_desc = remaining_desc[:chunk_size]
+            chunk_data = {key: '' for key in column_mapping.keys()}
+            chunk_data['description'] = chunk_desc
+            chunk_data['publication_number'] = first_chunk_data['publication_number']
+            chunks.append(chunk_data)
+            remaining_desc = remaining_desc[chunk_size:]
+
+    # Analyze each chunk
+    results = []
+    for i, chunk_data in enumerate(chunks):
+        try:
+            prompt = create_classification_prompt(prompt_template, chunk_data)
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a quantum technology expert specializing in patent analysis."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
+            )
+
+            response_text = response.choices[0].message.content.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+
+            result = json.loads(response_text)
+            results.append(result)
+
+        except Exception as e:
+            continue
+
+    # Combine results
+    if not results:
+        return {
+            "relevance": "ERROR",
+            "relevance_percentage": 0,
+            "confidence": "LOW",
+            "reasoning": "Failed to analyze any chunks",
+            "key_features_found": [],
+            "protocols_mentioned": [],
+            "relevance_source": "N/A"
+        }
+
+    # Take the highest relevance found
+    best_result = max(results, key=lambda x: x.get('relevance_percentage', 0))
+
+    # Combine features from all chunks
+    all_features = []
+    all_protocols = []
+    for r in results:
+        all_features.extend(r.get('key_features_found', []))
+        all_protocols.extend(r.get('protocols_mentioned', []))
+
+    best_result['key_features_found'] = list(set(all_features))
+    best_result['protocols_mentioned'] = list(set(all_protocols))
+    best_result['reasoning'] = f"[Chunked: {len(chunks)} parts] {best_result.get('reasoning', '')}"
+
+    return best_result
+
 
 def classify_patent(row: pd.Series, client, model: str, prompt_template: str, column_mapping: Dict) -> Dict:
     """Send patent data to Azure OpenAI for classification"""
@@ -165,6 +247,11 @@ def classify_patent(row: pd.Series, client, model: str, prompt_template: str, co
             "relevance_source": "N/A"
         }
     except Exception as e:
+        error_msg = str(e).lower()
+        # Check if it's a context length error
+        if 'context' in error_msg or 'token' in error_msg or 'length' in error_msg or 'too large' in error_msg or 'maximum' in error_msg:
+            return classify_patent_chunked(row, client, model, prompt_template, column_mapping)
+
         return {
             "relevance": "ERROR",
             "relevance_percentage": 0,
@@ -363,7 +450,7 @@ st.header("📁 Upload Patent Data")
 # Option to consolidate multi-row records
 consolidate_records = st.checkbox(
     "Consolidate multi-row patent records",
-    value=False,
+    value=True,
     help="Enable this if your CSV has patent descriptions split across multiple rows. This will merge them into single records."
 )
 
@@ -544,6 +631,73 @@ if uploaded_file is not None:
                             progress_bar,
                             status_text
                         )
+
+                    # Remove unnamed columns (columns that start with 'Unnamed:')
+                    unnamed_cols = [col for col in results_df.columns if str(col).startswith('Unnamed:')]
+                    if unnamed_cols:
+                        status_text.text(f"Removing {len(unnamed_cols)} unnamed columns...")
+                        results_df = results_df.drop(columns=unnamed_cols)
+
+                    # Split long descriptions into multiple columns
+                    # Excel cell limit is ~32,767 characters
+                    MAX_CELL_LENGTH = 32000
+
+                    # Find description column dynamically
+                    desc_col = None
+                    for col in results_df.columns:
+                        if 'description' in str(col).lower():
+                            desc_col = col
+                            break
+
+                    if desc_col:
+                        # Check if any descriptions need to be split
+                        descriptions_to_split = results_df[desc_col].fillna('').astype(str)
+                        needs_continuation = descriptions_to_split.str.len() > MAX_CELL_LENGTH
+
+                        if needs_continuation.any():
+                            status_text.text(f"Splitting {needs_continuation.sum()} long descriptions into continuation columns...")
+
+                            # Create description_continued column
+                            desc_continued_col = f'{desc_col}_continued'
+                            results_df[desc_continued_col] = ''
+
+                            for idx in results_df[needs_continuation].index:
+                                full_desc = str(results_df.loc[idx, desc_col])
+
+                                # Split the description
+                                results_df.loc[idx, desc_col] = full_desc[:MAX_CELL_LENGTH]
+                                results_df.loc[idx, desc_continued_col] = full_desc[MAX_CELL_LENGTH:]
+
+                                # If still too long, handle additional splits
+                                remaining = full_desc[MAX_CELL_LENGTH:]
+                                continuation_num = 2
+                                while len(remaining) > MAX_CELL_LENGTH:
+                                    col_name = f'{desc_col}_continued_{continuation_num}'
+                                    if col_name not in results_df.columns:
+                                        results_df[col_name] = ''
+
+                                    results_df.loc[idx, f'{desc_col}_continued_{continuation_num-1}'] = remaining[:MAX_CELL_LENGTH]
+                                    remaining = remaining[MAX_CELL_LENGTH:]
+                                    continuation_num += 1
+
+                                # Add the final remaining part
+                                if continuation_num > 2:
+                                    results_df.loc[idx, f'{desc_col}_continued_{continuation_num-1}'] = remaining
+
+                            # Reorder columns to place continuation columns next to description
+                            cols = list(results_df.columns)
+                            if desc_col in cols:
+                                desc_idx = cols.index(desc_col)
+                                # Get all continuation columns for this description
+                                continuation_cols = [col for col in cols if col.startswith(f'{desc_col}_continued')]
+                                # Remove continuation columns from their current positions
+                                for col in continuation_cols:
+                                    cols.remove(col)
+                                # Insert continuation columns right after description
+                                for i, col in enumerate(sorted(continuation_cols)):
+                                    cols.insert(desc_idx + 1 + i, col)
+                                # Reorder the dataframe
+                                results_df = results_df[cols]
 
                     st.session_state.results_df = results_df
                     st.session_state.processing_complete = True
