@@ -638,6 +638,20 @@ if uploaded_file is not None:
                         status_text.text(f"Removing {len(unnamed_cols)} unnamed columns...")
                         results_df = results_df.drop(columns=unnamed_cols)
 
+                    # Remove columns that were not mapped by the user (only keep selected input fields + AI output fields)
+                    # Identify which columns are from the original input
+                    mapped_input_cols = [v for k, v in column_mapping.items() if v and v != 'None']
+
+                    # Get all columns from original dataframe
+                    original_cols = df.columns.tolist()
+
+                    # Columns to remove: original columns that were NOT mapped by the user
+                    cols_to_remove = [col for col in original_cols if col in results_df.columns and col not in mapped_input_cols]
+
+                    if cols_to_remove:
+                        status_text.text(f"Removing {len(cols_to_remove)} unmapped input columns...")
+                        results_df = results_df.drop(columns=cols_to_remove)
+
                     # Split long descriptions into multiple columns
                     # Excel cell limit is ~32,767 characters
                     MAX_CELL_LENGTH = 32000

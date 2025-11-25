@@ -431,6 +431,23 @@ def main():
         print(f"\nRemoving {len(unnamed_cols)} unnamed columns: {unnamed_cols}")
         results_df = results_df.drop(columns=unnamed_cols)
 
+    # Keep only columns that existed in original input + AI-generated columns
+    # Expected input columns based on what classify_patent() uses
+    expected_input_cols = ['publication number', 'title', 'abstract', 'claims', 'description']
+
+    # Identify which expected columns actually exist in the original data
+    existing_input_cols = [col for col in expected_input_cols if col in df.columns]
+
+    # Get all columns from original dataframe
+    original_cols = df.columns.tolist()
+
+    # Columns to remove: original columns that are NOT in the expected list
+    cols_to_remove = [col for col in original_cols if col in results_df.columns and col not in existing_input_cols]
+
+    if cols_to_remove:
+        print(f"\nRemoving {len(cols_to_remove)} unused input columns: {cols_to_remove}")
+        results_df = results_df.drop(columns=cols_to_remove)
+
     # Split long descriptions into multiple columns
     # Excel cell limit is ~32,767 characters
     MAX_CELL_LENGTH = 32000
