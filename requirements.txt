@@ -7,5 +7,8 @@ python-dotenv>=1.0.0
 # Excel support
 openpyxl>=3.1.0
 
+# Azure Blob Storage (for persistent file storage)
+azure-storage-blob>=12.19.0
+
 # Optional: for better performance
 numpy>=1.24.0

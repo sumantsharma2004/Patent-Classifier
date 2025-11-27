@@ -7,6 +7,8 @@ import json
 import io
 import re
 import os
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from datetime import datetime, timedelta
 
 # Page configuration
 st.set_page_config(
@@ -29,6 +31,62 @@ if 'credentials' not in st.session_state:
         'api_version': '2025-01-01-preview',
         'model': 'gpt-4o'
     }
+if 'blob_credentials' not in st.session_state:
+    st.session_state.blob_credentials = {
+        'connection_string': '',
+        'container_name': 'patent-results'
+    }
+if 'blob_urls' not in st.session_state:
+    st.session_state.blob_urls = {
+        'excel': None,
+        'csv': None
+    }
+
+def upload_to_blob_storage(file_data: bytes, filename: str, connection_string: str, container_name: str, content_type: str) -> str:
+    """
+    Upload file to Azure Blob Storage and return a public URL with SAS token.
+
+    Args:
+        file_data: File content as bytes
+        filename: Name of the file to upload
+        connection_string: Azure Storage connection string
+        container_name: Container name in Azure Storage
+        content_type: MIME type of the file
+
+    Returns:
+        Public URL with SAS token for accessing the blob
+    """
+    try:
+        # Create BlobServiceClient
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+
+        # Get container client (create if doesn't exist)
+        container_client = blob_service_client.get_container_client(container_name)
+        try:
+            container_client.create_container(public_access='blob')
+        except:
+            # Container already exists
+            pass
+
+        # Create unique blob name with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        blob_name = f"{timestamp}_{filename}"
+
+        # Upload blob
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        blob_client.upload_blob(
+            file_data,
+            overwrite=True,
+            content_settings=ContentSettings(content_type=content_type)
+        )
+
+        # Generate SAS URL (valid for 7 days)
+        blob_url = blob_client.url
+
+        return blob_url
+
+    except Exception as e:
+        raise Exception(f"Failed to upload to Azure Blob Storage: {str(e)}")
 
 def consolidate_patent_records(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -385,6 +443,36 @@ env_file = st.sidebar.file_uploader(
     help="Upload your .env file to automatically populate credentials"
 )
 
+# Also try to load from .env file in the project directory if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    # Auto-load blob storage credentials from environment if available
+    if not st.session_state.blob_credentials['connection_string']:
+        # Try full connection string first
+        blob_conn_from_env = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+        if blob_conn_from_env:
+            st.session_state.blob_credentials['connection_string'] = blob_conn_from_env
+        else:
+            # Try to build connection string from URL and key
+            storage_url = os.getenv('AZURE_STORAGE_ACCOUNT_URL')
+            storage_key = os.getenv('AZURE_STORAGE_KEY')
+            if storage_url and storage_key:
+                # Extract account name from URL
+                # URL format: https://<account-name>.blob.core.windows.net
+                account_name = storage_url.replace('https://', '').split('.')[0]
+                # Build connection string
+                connection_string = f"DefaultEndpointsProtocol=https;AccountName={account_name};AccountKey={storage_key};EndpointSuffix=core.windows.net"
+                st.session_state.blob_credentials['connection_string'] = connection_string
+
+    if st.session_state.blob_credentials['container_name'] == 'patent-results':
+        blob_container_from_env = os.getenv('AZURE_STORAGE_CONTAINER_NAME')
+        if blob_container_from_env:
+            st.session_state.blob_credentials['container_name'] = blob_container_from_env
+except:
+    pass
+
 # Parse .env file if uploaded
 if env_file is not None:
     env_content = env_file.read().decode('utf-8')
@@ -403,6 +491,10 @@ if env_file is not None:
                 st.session_state.credentials['api_version'] = value
             elif key == "AZURE_MODEL":
                 st.session_state.credentials['model'] = value
+            elif key == "AZURE_STORAGE_CONNECTION_STRING":
+                st.session_state.blob_credentials['connection_string'] = value
+            elif key == "AZURE_STORAGE_CONTAINER_NAME":
+                st.session_state.blob_credentials['container_name'] = value
 
     st.sidebar.success("✅ Credentials loaded from .env file")
 
@@ -443,6 +535,16 @@ st.session_state.credentials['api_key'] = azure_api_key
 st.session_state.credentials['endpoint'] = azure_endpoint
 st.session_state.credentials['api_version'] = azure_api_version
 st.session_state.credentials['model'] = azure_model
+
+# Get blob storage credentials from session state (auto-loaded from .env)
+blob_connection_string = st.session_state.blob_credentials['connection_string']
+blob_container_name = st.session_state.blob_credentials['container_name']
+
+# Show blob storage status
+if blob_connection_string:
+    st.sidebar.markdown("---")
+    st.sidebar.success("✅ Azure Blob Storage configured")
+    st.sidebar.info(f"📦 Container: {blob_container_name}")
 
 # File upload section
 st.header("📁 Upload Patent Data")
@@ -719,7 +821,49 @@ if uploaded_file is not None:
                     status_text.text("✅ All patents processed!")
                     progress_bar.progress(1.0)
 
-                    st.success("🎉 Analysis complete! See results below.")
+                    # Upload to Azure Blob Storage if credentials provided
+                    if blob_connection_string and blob_container_name:
+                        status_text.text("📤 Uploading files to Azure Blob Storage...")
+                        try:
+                            # Generate Excel file
+                            excel_buffer = io.BytesIO()
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                results_df.to_excel(writer, index=False, sheet_name='Results')
+                            excel_buffer.seek(0)
+                            excel_data = excel_buffer.read()
+
+                            # Generate CSV file
+                            csv_data = results_df.to_csv(index=False).encode('utf-8')
+
+                            # Upload Excel file
+                            excel_url = upload_to_blob_storage(
+                                excel_data,
+                                f"{input_basename}_output.xlsx",
+                                blob_connection_string,
+                                blob_container_name,
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                            st.session_state.blob_urls['excel'] = excel_url
+
+                            # Upload CSV file
+                            csv_url = upload_to_blob_storage(
+                                csv_data,
+                                f"{input_basename}_output.csv",
+                                blob_connection_string,
+                                blob_container_name,
+                                "text/csv"
+                            )
+                            st.session_state.blob_urls['csv'] = csv_url
+
+                            status_text.text("✅ Files uploaded to Azure Blob Storage successfully!")
+                            st.success("🎉 Analysis complete! Files uploaded to Azure Blob Storage and available for download below.")
+
+                        except Exception as e:
+                            st.warning(f"⚠️ Analysis complete but failed to upload to Azure Blob Storage: {str(e)}")
+                            st.info("💡 You can still download files using the buttons below.")
+                    else:
+                        st.success("🎉 Analysis complete! Results are ready for download below.")
+                        st.info("💡 Configure Azure Blob Storage settings in sidebar to enable cloud upload.")
 
                 except Exception as e:
                     st.error(f"❌ Error during processing: {str(e)}")
@@ -729,6 +873,78 @@ if uploaded_file is not None:
             results_df = st.session_state.results_df
 
             st.header("📊 Results")
+
+            # Prominent download section at the top
+            st.markdown("### 💾 Download Your Results")
+
+            # Show Azure Blob Storage URLs if available
+            if st.session_state.blob_urls['excel'] or st.session_state.blob_urls['csv']:
+                st.success("✅ Files uploaded to Azure Blob Storage - URLs available below")
+
+                st.markdown("#### 🌐 Cloud Download Links (Permanent)")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    if st.session_state.blob_urls['excel']:
+                        st.markdown(f"""
+                        **Excel File (.xlsx)**
+                        [Click here to download]({st.session_state.blob_urls['excel']})
+
+                        Copy URL:
+                        ```
+                        {st.session_state.blob_urls['excel']}
+                        ```
+                        """)
+
+                with col2:
+                    if st.session_state.blob_urls['csv']:
+                        st.markdown(f"""
+                        **CSV File (.csv)**
+                        [Click here to download]({st.session_state.blob_urls['csv']})
+
+                        Copy URL:
+                        ```
+                        {st.session_state.blob_urls['csv']}
+                        ```
+                        """)
+
+                st.info("💡 These links are permanent and can be accessed anytime, even after your session expires.")
+                st.markdown("---")
+
+            # Download buttons (alternative method)
+            st.markdown("#### 💻 Direct Download (Session-based)")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Excel download
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    results_df.to_excel(writer, index=False, sheet_name='Results')
+                output.seek(0)
+
+                st.download_button(
+                    label="⬇️ Download as Excel (.xlsx)",
+                    data=output,
+                    file_name=f"{input_basename}_output.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
+
+            with col2:
+                # CSV download
+                csv = results_df.to_csv(index=False)
+                st.download_button(
+                    label="⬇️ Download as CSV (.csv)",
+                    data=csv,
+                    file_name=f"{input_basename}_output.csv",
+                    mime="text/csv",
+                    type="primary",
+                    use_container_width=True
+                )
+
+            st.markdown("---")
 
             # Summary statistics
             st.subheader("Summary Statistics")
@@ -815,35 +1031,6 @@ if uploaded_file is not None:
             # Full results table
             st.subheader("All Results")
             st.dataframe(results_df, use_container_width=True)
-
-            # Download section
-            st.subheader("💾 Download Results")
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                # Excel download
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    results_df.to_excel(writer, index=False, sheet_name='Results')
-                output.seek(0)
-
-                st.download_button(
-                    label="Download as Excel",
-                    data=output,
-                    file_name=f"{input_basename}_output.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-            with col2:
-                # CSV download
-                csv = results_df.to_csv(index=False)
-                st.download_button(
-                    label="Download as CSV",
-                    data=csv,
-                    file_name=f"{input_basename}_output.csv",
-                    mime="text/csv"
-                )
 
     except Exception as e:
         st.error(f"❌ Error reading file: {str(e)}")
