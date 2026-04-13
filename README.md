@@ -1,3 +1,5 @@
+Copyright (c) 2026 Guurav Santhalia
+
 # QKD Patent Analyzer
 
 ## Overview

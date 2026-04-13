@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Guurav Santhalia
+
 import pandas as pd
 import os
 from openai import AzureOpenAI
